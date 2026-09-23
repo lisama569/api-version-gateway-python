@@ -1,8 +1,4 @@
-from fastapi import FastAPI
+"""本地启动入口：uvicorn main:app --reload"""
+from app.main import app
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
