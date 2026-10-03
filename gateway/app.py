@@ -17,6 +17,7 @@ from pydantic import BaseModel, ValidationError
 
 from gateway.config import Settings, VersionStatus, default_settings
 from gateway.errors import (
+    BatchValidationError,
     GatewayError,
     IdempotencyKeyMissingError,
     QuotaExceededError,
@@ -24,11 +25,12 @@ from gateway.errors import (
 from gateway.idempotency import (
     ACQUIRED,
     COMPLETED,
+    FAILED,
     INFLIGHT,
     IdempotencyStore,
     fingerprint_payload,
 )
-from gateway.ratelimit import RateLimiter
+from gateway.ratelimit import QuotaDecision, RateLimiter
 from gateway.resources import OrderService
 from gateway.versioning import API_VERSION_HEADER, negotiate_version
 
@@ -38,6 +40,7 @@ CALLER_HEADER = "X-Caller-Id"
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 ANONYMOUS_CALLER = "anonymous"
 IDEMPOTENCY_WAIT_SECONDS = 10.0
+BATCH_ORDERS_PATH = "/orders/batch"
 
 # 不需要版本声明/配额的公共端点
 _EXEMPT_PATHS = {
@@ -55,6 +58,24 @@ class CreateOrderBody(BaseModel):
     name: str
     quantity: int = 1
     amount: int = 0
+
+
+class BatchCreateOrdersBody(BaseModel):
+    """批量下单请求体：orders 至少 1 条，每条与单笔下单字段一致。"""
+
+    orders: list[CreateOrderBody]
+
+
+def resolve_quota_rule(settings: Settings, caller: str):
+    """按调用方解析配额规则（具名配置 > 匿名规则 > 默认规则）。"""
+    return (
+        settings.quotas.get(caller)
+        or (
+            settings.anonymous_quota
+            if caller == ANONYMOUS_CALLER
+            else settings.default_quota
+        )
+    )
 
 
 @dataclass
@@ -174,46 +195,54 @@ def _register_middleware(app: FastAPI, state: GatewayState, clock: Callable[[], 
             successor=info.successor,
         )
 
-        # 2) 调用方识别 + 配额限流（每次请求都计数，包括重放与被拒请求）
+        # 2) 调用方识别 + 配额限流
         caller = request.headers.get(CALLER_HEADER) or ANONYMOUS_CALLER
-        rule = (
-            state.settings.quotas.get(caller)
-            or (
-                state.settings.anonymous_quota
-                if caller == ANONYMOUS_CALLER
-                else state.settings.default_quota
-            )
-        )
-        quota = state.limiter.check(caller, rule, now=clock())
-        log_event(
-            "quota_decision",
-            caller=caller,
-            allowed=str(quota.allowed).lower(),
-            used=quota.used,
-            limit=quota.limit,
-            window_seconds=quota.window_seconds,
-            reset_in_seconds=quota.retry_after_seconds,
-        )
-        if not quota.allowed:
-            exc = QuotaExceededError(
-                f"调用方 {caller} 已超出 {quota.window_seconds:g}s 窗口配额"
-                f"（{quota.limit} 次），请在窗口重置后重试。",
-                details={
-                    "caller": caller,
-                    "limit": quota.limit,
-                    "window_seconds": quota.window_seconds,
-                    "retry_after_seconds": quota.retry_after_seconds,
-                },
-            )
-            response = JSONResponse(
-                status_code=exc.status_code,
-                content=_error_payload(exc.error_code, exc.message, exc.details),
-                headers={"Retry-After": str(int(quota.retry_after_seconds))},
-            )
-        else:
+        rule = resolve_quota_rule(state.settings, caller)
+        is_batch = path == BATCH_ORDERS_PATH
+        if is_batch:
+            # 批量下单的配额按"实际占用条数"在路由内 reserve，中间件不按请求次数记账
             request.state.api_version = info.version
             request.state.caller = caller
+            request.state.quota_decision = None
             response = await call_next(request)
+            quota: QuotaDecision | None = getattr(
+                request.state, "quota_decision", None
+            )
+            if quota is None:
+                # 路由在计费前结束（如 400 校验失败）：用纯观测快照填充限流头
+                quota = state.limiter.snapshot(caller, rule, now=clock())
+        else:
+            # 单笔/读取路径：每次请求都计数，包括重放与被拒请求
+            quota = state.limiter.check(caller, rule, now=clock())
+            log_event(
+                "quota_decision",
+                caller=caller,
+                allowed=str(quota.allowed).lower(),
+                used=quota.used,
+                limit=quota.limit,
+                window_seconds=quota.window_seconds,
+                reset_in_seconds=quota.retry_after_seconds,
+            )
+            if not quota.allowed:
+                exc = QuotaExceededError(
+                    f"调用方 {caller} 已超出 {quota.window_seconds:g}s 窗口配额"
+                    f"（{quota.limit} 次），请在窗口重置后重试。",
+                    details={
+                        "caller": caller,
+                        "limit": quota.limit,
+                        "window_seconds": quota.window_seconds,
+                        "retry_after_seconds": quota.retry_after_seconds,
+                    },
+                )
+                response = JSONResponse(
+                    status_code=exc.status_code,
+                    content=_error_payload(exc.error_code, exc.message, exc.details),
+                    headers={"Retry-After": str(int(quota.retry_after_seconds))},
+                )
+            else:
+                request.state.api_version = info.version
+                request.state.caller = caller
+                response = await call_next(request)
 
         # 限流元信息 + 弃用提示（无论业务成功与否都附加，保证提示可观测）
         response.headers["X-RateLimit-Limit"] = str(quota.limit)
@@ -292,7 +321,7 @@ def _register_routes(app: FastAPI, state: GatewayState) -> None:
         payload = body.model_dump()
         fingerprint = fingerprint_payload(payload)
 
-        outcome = state.idempotency.acquire(key, fingerprint)
+        outcome = state.idempotency.acquire(key, fingerprint, namespace=caller)
         log_event(
             "idempotency_decision",
             idempotency_key=key,
@@ -310,9 +339,10 @@ def _register_routes(app: FastAPI, state: GatewayState) -> None:
                 idempotency_key=key,
                 outcome="waiting",
                 timeout_seconds=IDEMPOTENCY_WAIT_SECONDS,
+                caller=caller,
             )
             entry = state.idempotency.wait_for_completion(
-                key, timeout=IDEMPOTENCY_WAIT_SECONDS
+                key, timeout=IDEMPOTENCY_WAIT_SECONDS, namespace=caller
             )
             if entry is None or entry.status == INFLIGHT:
                 return JSONResponse(
@@ -326,7 +356,11 @@ def _register_routes(app: FastAPI, state: GatewayState) -> None:
                 )
             outcome = entry.status
 
-        return _replay_idempotent_result(key, outcome, state)
+        return _replay_idempotent_result(key, outcome, state, caller)
+
+    @app.post(BATCH_ORDERS_PATH, status_code=201)
+    async def create_orders_batch(request: Request) -> JSONResponse:
+        return await _handle_batch_create(request, state)
 
     @app.get("/orders/{order_id}")
     async def read_order(order_id: str, request: Request) -> dict[str, Any]:
@@ -353,32 +387,35 @@ def _execute_with_idempotency(
     try:
         order = state.orders.create_order(caller, payload)
     except GatewayError as exc:
-        state.idempotency.fail(key, exc.error_code, exc.status_code)
+        state.idempotency.fail(key, exc.error_code, exc.status_code, namespace=caller)
         log_event(
             "idempotency_decision",
             idempotency_key=key,
             outcome="failed",
             error_code=exc.error_code,
+            caller=caller,
         )
         raise
     except Exception as exc:  # pragma: no cover - 防御性记录
-        state.idempotency.fail(key, "internal_error", 500)
+        state.idempotency.fail(key, "internal_error", 500, namespace=caller)
         log_event(
             "idempotency_decision",
             idempotency_key=key,
             outcome="failed",
             error_code="internal_error",
+            caller=caller,
         )
         raise
 
     body = {"order": order.to_dict(), "api_version": version}
-    state.idempotency.complete(key, body, 201)
+    state.idempotency.complete(key, body, 201, namespace=caller)
     log_event(
         "idempotency_decision",
         idempotency_key=key,
         outcome="completed",
         resource_id=order.id,
         side_effects=state.orders.side_effects,
+        caller=caller,
     )
     return JSONResponse(
         status_code=201,
@@ -388,15 +425,16 @@ def _execute_with_idempotency(
 
 
 def _replay_idempotent_result(
-    key: str, outcome: str, state: GatewayState
+    key: str, outcome: str, state: GatewayState, caller: str
 ) -> JSONResponse:
     """重复提交路径：回放首个请求的结论，不产生任何副作用。"""
-    entry = state.idempotency.get_result(key)
+    entry = state.idempotency.get_result(key, namespace=caller)
     log_event(
         "idempotency_decision",
         idempotency_key=key,
         outcome="replay",
         stored_outcome=outcome,
+        caller=caller,
     )
     if outcome == COMPLETED and entry is not None:
         return JSONResponse(
@@ -416,6 +454,242 @@ def _replay_idempotent_result(
             {"idempotency_key": key, "original_error_code": error_code},
         ),
         headers={"Idempotency-Key": key, "Idempotent-Replay": "true"},
+    )
+
+
+def _replay_batch_result(
+    key: str,
+    outcome: str,
+    state: GatewayState,
+    caller: str,
+) -> JSONResponse:
+    """批量请求的重复提交路径：回放首批结论，不产生任何副作用与额度占用。"""
+    entry = state.idempotency.get_result(key, namespace=caller)
+    log_event(
+        "batch_idempotency_decision",
+        idempotency_key=key,
+        outcome="replay",
+        stored_outcome=outcome,
+        caller=caller,
+    )
+    if outcome == COMPLETED and entry is not None:
+        return JSONResponse(
+            status_code=entry.status_code,
+            content=entry.response,
+            headers={"Idempotency-Key": key, "Idempotent-Replay": "true"},
+        )
+    error_code = entry.error_code if entry is not None else "unknown"
+    status_code = entry.status_code if entry is not None else 409
+    return JSONResponse(
+        status_code=status_code,
+        content=_error_payload(
+            f"idempotent_replay_{error_code}",
+            f"幂等键 {key} 的首批请求此前已失败（{error_code}），未产生任何副作用；"
+            "如需重新提交请更换新的幂等键。",
+            {"idempotency_key": key, "original_error_code": error_code},
+        ),
+        headers={"Idempotency-Key": key, "Idempotent-Replay": "true"},
+    )
+
+
+def _quota_exceeded_response(
+    caller: str, decision: QuotaDecision, key: str
+) -> JSONResponse:
+    """构造批量配额不足响应：说清需要多少、还剩多少、最早何时可重试。"""
+    required = decision.requested_cost
+    remaining = decision.remaining
+    earliest = decision.earliest_fit_at
+    headers = {"Idempotency-Key": key, "Idempotent-Replay": "false"}
+    if earliest is None:
+        # 单笔成本超过窗口上限：任何窗口都装不下，重试无意义，不给 Retry-After
+        retry_after_seconds: float | None = None
+        message = (
+            f"本批需要 {required} 条额度，超过调用方 {caller} 的窗口配额上限"
+            f"（{decision.limit} 条/{decision.window_seconds:g}s），"
+            "任何时刻都无法整批受理，请拆分后提交。"
+        )
+    else:
+        retry_after_seconds = decision.retry_after_seconds
+        message = (
+            f"本批需要 {required} 条额度，当前窗口剩余 {remaining} 条，"
+            f"不足以覆盖整批；预计 {int(retry_after_seconds)} 秒后有足够额度，"
+            "请整批重试。"
+        )
+        if retry_after_seconds > 0:
+            headers["Retry-After"] = str(int(retry_after_seconds))
+    details = {
+        "caller": caller,
+        "required": required,
+        "remaining": remaining,
+        "limit": decision.limit,
+        "used": decision.used,
+        "window_seconds": decision.window_seconds,
+        "retry_after_seconds": retry_after_seconds,
+    }
+    log_event(
+        "batch_quota_decision",
+        caller=caller,
+        allowed="false",
+        required=required,
+        remaining=remaining,
+        used=decision.used,
+        limit=decision.limit,
+        retry_after_seconds=retry_after_seconds,
+    )
+    return JSONResponse(
+        status_code=429,
+        content=_error_payload("quota_exceeded", message, details),
+        headers=headers,
+    )
+
+
+async def _handle_batch_create(request: Request, state: GatewayState) -> JSONResponse:
+    """批量下单：整批原子 + 幂等回放 + 按条数预留配额。"""
+    caller: str = request.state.caller
+    version: str = request.state.api_version
+
+    key = request.headers.get(IDEMPOTENCY_HEADER)
+    if not key or not key.strip():
+        raise IdempotencyKeyMissingError(
+            "批量写请求必须携带 Idempotency-Key 头以保证幂等。",
+            details={"header": IDEMPOTENCY_HEADER},
+        )
+    key = key.strip()
+
+    try:
+        raw_body = await request.json()
+        body = BatchCreateOrdersBody.model_validate(raw_body)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors()) from exc
+    except ValueError as exc:
+        raise RequestValidationError(
+            [{"type": "json_invalid", "loc": ["body"], "msg": "请求体必须是合法 JSON。"}]
+        ) from exc
+
+    items = [item.model_dump() for item in body.orders]
+    if not items:
+        raise BatchValidationError(
+            "批量下单至少需要 1 条订单。",
+            details={"index": None, "reason": "empty_batch"},
+        )
+    # 业务校验：逐张检查，整批拒绝并指出是哪一条
+    for index, item in enumerate(items):
+        if not str(item.get("name", "")).strip():
+            raise BatchValidationError(
+                f"第 {index} 条订单的 name 不能为空。",
+                details={"index": index, "field": "name", "reason": "empty_name"},
+            )
+        if int(item.get("quantity", 1)) <= 0:
+            raise BatchValidationError(
+                f"第 {index} 条订单的 quantity 必须为正整数。",
+                details={"index": index, "field": "quantity",
+                         "reason": "non_positive", "value": item.get("quantity")},
+            )
+
+    cost = len(items)
+    rule = resolve_quota_rule(state.settings, caller)
+    payload_fingerprint_input = {"orders": items}
+    fingerprint = fingerprint_payload(payload_fingerprint_input)
+
+    # 幂等占位循环：占位赢家在产生副作用前若放弃（配额不足），会 release，
+    # 等待者被唤醒后重新占位，由后续请求再试一次。
+    outcome = state.idempotency.acquire(key, fingerprint, namespace=caller)
+    log_event(
+        "batch_idempotency_decision",
+        idempotency_key=key,
+        fingerprint=fingerprint[:12],
+        outcome=outcome,
+        caller=caller,
+        batch_size=cost,
+    )
+
+    while True:
+        if outcome == COMPLETED or outcome == FAILED:
+            return _replay_batch_result(key, outcome, state, caller)
+
+        if outcome == INFLIGHT:
+            entry = state.idempotency.wait_for_completion(
+                key, timeout=IDEMPOTENCY_WAIT_SECONDS, namespace=caller
+            )
+            if entry is None:
+                # 占位被前一个请求释放（它未产生副作用）：重新占位再试
+                outcome = state.idempotency.acquire(key, fingerprint, namespace=caller)
+                log_event(
+                    "batch_idempotency_decision",
+                    idempotency_key=key,
+                    outcome="reacquired_after_release",
+                    caller=caller,
+                )
+                continue
+            if entry.status == INFLIGHT:
+                return JSONResponse(
+                    status_code=409,
+                    content=_error_payload(
+                        "idempotency_inflight",
+                        f"幂等键 {key} 的首批请求仍在处理中，本次未产生副作用；"
+                        "请稍后携带同一幂等键重试以获取最终结论。",
+                        {"idempotency_key": key},
+                    ),
+                )
+            return _replay_batch_result(key, entry.status, state, caller)
+
+        # outcome == ACQUIRED：本请求是占位赢家
+        break
+
+    # 1) 先按整批条数原子预留额度：容纳不下则整批拒绝，不写任何一条
+    decision = state.limiter.reserve(caller, rule, cost=cost)
+    request.state.quota_decision = decision
+    log_event(
+        "batch_quota_decision",
+        caller=caller,
+        allowed=str(decision.allowed).lower(),
+        required=cost,
+        used=decision.used,
+        remaining=decision.remaining,
+        limit=decision.limit,
+        window_seconds=decision.window_seconds,
+        retry_after_seconds=decision.retry_after_seconds,
+    )
+    if not decision.allowed:
+        # 未产生任何副作用：释放占位，让后续携同键请求可以重新尝试
+        state.idempotency.release(key, namespace=caller)
+        return _quota_exceeded_response(caller, decision, key)
+
+    reservation_id = decision.reservation_id
+    try:
+        # 2) 原子写入：全部成功提交，或内部失败时一条都不留
+        orders = state.orders.create_orders_batch(caller, items)
+    except GatewayError as exc:
+        state.limiter.refund(caller, reservation_id)
+        state.idempotency.fail(key, exc.error_code, exc.status_code, namespace=caller)
+        raise
+    except Exception:
+        # 防御：写入异常时退还额度并记录失败结论，保证不泄露额度/不留半成品
+        state.limiter.refund(caller, reservation_id)
+        state.idempotency.fail(key, "internal_error", 500, namespace=caller)
+        raise
+
+    response_body = {
+        "orders": [o.to_dict() for o in orders],
+        "created_count": len(orders),
+        "batch_size": cost,
+        "api_version": version,
+    }
+    state.idempotency.complete(key, response_body, 201, namespace=caller)
+    request.state.quota_decision = state.limiter.snapshot(caller, rule)
+    log_event(
+        "batch_idempotency_decision",
+        idempotency_key=key,
+        outcome="completed",
+        caller=caller,
+        batch_size=cost,
+        created_count=len(orders),
+        side_effects=state.orders.side_effects,
+    )
+    return JSONResponse(
+        status_code=201,
+        content=response_body,
+        headers={"Idempotency-Key": key, "Idempotent-Replay": "false"},
     )
 
 

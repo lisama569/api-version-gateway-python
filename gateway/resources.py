@@ -49,6 +49,33 @@ class OrderService:
             self.side_effects += 1
             return order
 
+    def create_orders_batch(
+        self, caller: str, payloads: list[dict[str, Any]]
+    ) -> list[Order]:
+        """原子写入多条订单：要么全部生效，要么一条都不生效。
+
+        先在锁外（调用方已持有幂等占位，无其他写者竞争同一批）构建全部
+        Order 对象，再在同一把临界区内一次性提交；提交不做"写一条算一条"，
+        因此任何失败都不会留下部分写入。side_effects 按实际写入条数递增。
+        """
+        prepared: list[Order] = []
+        for payload in payloads:
+            prepared.append(
+                Order(
+                    id=uuid.uuid4().hex[:12],
+                    name=str(payload["name"]),
+                    quantity=int(payload.get("quantity", 1)),
+                    amount=int(payload.get("amount", 0)),
+                    created_by=caller,
+                )
+            )
+        with self._lock:
+            for order in prepared:
+                self._seq += 1
+                self._orders[order.id] = order
+                self.side_effects += 1
+        return prepared
+
     def get_order(self, order_id: str) -> Order:
         with self._lock:
             order = self._orders.get(order_id)

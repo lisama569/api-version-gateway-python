@@ -48,6 +48,13 @@ class IdempotencyConflictError(GatewayError):
     error_code = "idempotency_conflict"
 
 
+class BatchValidationError(GatewayError):
+    """批量请求中某一条目不合法（整批拒绝，不写入任何一条）。"""
+
+    status_code = 400
+    error_code = "batch_item_invalid"
+
+
 class QuotaExceededError(GatewayError):
     """调用方超出时间窗口配额。"""
 

@@ -95,10 +95,10 @@ def test_inflight_duplicate_returns_explainable_conflict(client):
     from gateway.idempotency import fingerprint_payload
 
     fp = fingerprint_payload({"name": "slow", "quantity": 1, "amount": 0})
-    assert store.acquire("slow-key", fp) == ACQUIRED  # 模拟首个请求占位未完成
+    assert store.acquire("slow-key", fp, namespace="premium") == ACQUIRED  # 模拟首个请求占位未完成
 
     def finish_later() -> None:
-        store.complete("slow-key", {"order": {"id": "late"}}, 201)
+        store.complete("slow-key", {"order": {"id": "late"}}, 201, namespace="premium")
 
     timer = threading.Timer(0.05, finish_later)
     timer.start()
@@ -125,7 +125,7 @@ def test_failed_first_attempt_replayed_with_explanation(client, monkeypatch):
         client.post(
             "/orders", json={"name": "x"}, headers={**H, "Idempotency-Key": "fail-key"}
         )
-    entry = state.idempotency.get_result("fail-key")
+    entry = state.idempotency.get_result("fail-key", namespace="premium")
     assert entry.status == "failed"
     assert entry.error_code == "internal_error"
 
@@ -156,7 +156,7 @@ def test_inflight_timeout_returns_explainable_409(client):
     from gateway.idempotency import fingerprint_payload
 
     fp = fingerprint_payload({"name": "hung", "quantity": 1, "amount": 0})
-    store.acquire("hung-key", fp)  # 永不 complete
+    store.acquire("hung-key", fp, namespace="premium")  # 永不 complete
 
     original_wait = IdempotencyStore.wait_for_completion
 
