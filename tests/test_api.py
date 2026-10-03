@@ -92,13 +92,15 @@ def test_quota_exhaustion_logged_with_denial_basis(client, caplog):
 def test_inflight_duplicate_returns_explainable_conflict(client):
     """首个请求仍在处理时到达的重复请求：409 + 可解释结论，而非静默丢弃。"""
     store = client.app.state.gateway.idempotency
+    from gateway.app import scoped_idempotency_key
     from gateway.idempotency import fingerprint_payload
 
     fp = fingerprint_payload({"name": "slow", "quantity": 1, "amount": 0})
-    assert store.acquire("slow-key", fp) == ACQUIRED  # 模拟首个请求占位未完成
+    scoped = scoped_idempotency_key("premium", "slow-key")
+    assert store.acquire(scoped, fp) == ACQUIRED  # 模拟首个请求占位未完成
 
     def finish_later() -> None:
-        store.complete("slow-key", {"order": {"id": "late"}}, 201)
+        store.complete(scoped, {"order": {"id": "late"}}, 201)
 
     timer = threading.Timer(0.05, finish_later)
     timer.start()
@@ -125,7 +127,9 @@ def test_failed_first_attempt_replayed_with_explanation(client, monkeypatch):
         client.post(
             "/orders", json={"name": "x"}, headers={**H, "Idempotency-Key": "fail-key"}
         )
-    entry = state.idempotency.get_result("fail-key")
+    from gateway.app import scoped_idempotency_key
+
+    entry = state.idempotency.get_result(scoped_idempotency_key("premium", "fail-key"))
     assert entry.status == "failed"
     assert entry.error_code == "internal_error"
 
@@ -153,10 +157,11 @@ def test_inflight_timeout_returns_explainable_409(client):
     import gateway.app as appmod
 
     store = client.app.state.gateway.idempotency
+    from gateway.app import scoped_idempotency_key
     from gateway.idempotency import fingerprint_payload
 
     fp = fingerprint_payload({"name": "hung", "quantity": 1, "amount": 0})
-    store.acquire("hung-key", fp)  # 永不 complete
+    store.acquire(scoped_idempotency_key("premium", "hung-key"), fp)  # 永不 complete
 
     original_wait = IdempotencyStore.wait_for_completion
 

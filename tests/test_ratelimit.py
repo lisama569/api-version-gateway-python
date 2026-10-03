@@ -41,14 +41,18 @@ def test_window_rollover_no_gap():
     assert rl.current_usage("c") == 1
 
 
-def test_rejected_requests_still_counted():
+def test_rejected_requests_do_not_consume_quota():
+    """被限流拒绝的请求不记账：重试刷不出额外名额，也不污染窗口内的占用。"""
     t = 0.0
     rl = RateLimiter(clock=lambda: t)
     rule = QuotaRule(limit=1, window_seconds=10.0)
     assert rl.check("c", rule).allowed
     for _ in range(5):
         assert not rl.check("c", rule).allowed
-    assert rl.current_usage("c") == 6  # 超限请求不能刷出“额外名额”
+    assert rl.current_usage("c") == 1  # 只有成功占用计入额度
+    t = 10.0                           # 窗口滑过后额度完整恢复
+    d = rl.check("c", rule)
+    assert d.allowed and d.remaining == 0
 
 
 def test_callers_isolated():
@@ -59,6 +63,86 @@ def test_callers_isolated():
     assert rl.check("b", rule).allowed
     assert not rl.check("a", rule).allowed
     assert not rl.check("b", rule).allowed
+
+
+def test_sliding_window_edge_no_double_spend():
+    """任意 window 长度内成功占用 ≤ 配额：窗口边缘的密集请求也不能借切窗翻倍。"""
+    t = 0.0
+    rl = RateLimiter(clock=lambda: t)
+    rule = QuotaRule(limit=2, window_seconds=10.0)
+    assert rl.check("c", rule).allowed          # t=0
+    t = 9.5
+    assert rl.check("c", rule).allowed          # t=9.5 → 窗口内已满
+    t = 10.0                                    # 固定窗口在此刻会切窗整体放行
+    assert rl.check("c", rule).allowed          # 滑动窗口：仅 t=0 的占用滑出，释放 1 条
+    assert not rl.check("c", rule).allowed      # 不能借切窗再放行第二条
+    assert rl.current_usage("c") == 2
+    t = 19.6                                    # t=9.5 的占用也滑出窗口（t=10 的仍在）
+    assert rl.check("c", rule).allowed
+
+
+def test_cost_based_accounting_atomic():
+    """按条数计费：剩余额度不足整批时整体拒绝，且不扣任何额度。"""
+    t = 0.0
+    rl = RateLimiter(clock=lambda: t)
+    rule = QuotaRule(limit=5, window_seconds=10.0)
+    d = rl.check("c", rule, cost=3)
+    assert d.allowed and d.remaining == 2
+    d = rl.check("c", rule, cost=3)   # 需要 3 条，只剩 2 条 → 整体拒绝
+    assert not d.allowed
+    assert d.remaining == 2
+    assert rl.current_usage("c") == 3  # 拒绝未扣额度
+    d = rl.check("c", rule, cost=2)
+    assert d.allowed and d.remaining == 0
+
+
+def test_cost_exceeding_limit_never_fits():
+    """单批条数超过配额上限：等多久都不够，retry_after=0 交由上层提示拆分。"""
+    t = 0.0
+    rl = RateLimiter(clock=lambda: t)
+    rule = QuotaRule(limit=2, window_seconds=10.0)
+    d = rl.check("c", rule, cost=5)
+    assert not d.allowed
+    assert d.retry_after_seconds == 0.0
+    assert rl.current_usage("c") == 0
+
+
+def test_retry_after_points_to_earliest_sufficient_release():
+    """批量被拒时：retry_after 指向“累计释放足够条数”的最早时刻。"""
+    t = 0.0
+    rl = RateLimiter(clock=lambda: t)
+    rule = QuotaRule(limit=4, window_seconds=10.0)
+    rl.check("c", rule, cost=2)          # t=0 占用 2 条
+    t = 3.0
+    rl.check("c", rule, cost=2)          # t=3 占用 2 条 → 窗口已满
+    d = rl.check("c", rule, cost=3)      # 需要再释放 3 条：t=0 的 2 条 + t=3 的占用
+    assert not d.allowed
+    assert d.retry_after_seconds == 10.0  # 等到 t=13（ceil(3+10-3)）才凑得齐
+
+
+def test_concurrent_multicost_no_overspend():
+    """并发批量扣减：成功占用合计不超过配额。"""
+    t = 0.0
+    rl = RateLimiter(clock=lambda: t)
+    rule = QuotaRule(limit=10, window_seconds=60.0)
+    n = 20
+    barrier = threading.Barrier(n)
+    allowed: list[bool] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        barrier.wait()
+        d = rl.check("hot", rule, cost=3)
+        with lock:
+            allowed.append(d.allowed)
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for x in threads:
+        x.start()
+    for x in threads:
+        x.join()
+    assert sum(allowed) == 3              # 10 条额度最多容纳 3 批（各 3 条）
+    assert rl.current_usage("hot") == 9   # 未透支
 
 
 def test_concurrent_counting_no_undercount():
@@ -82,7 +166,7 @@ def test_concurrent_counting_no_undercount():
     for x in threads:
         x.join()
     assert sum(allowed) == 50
-    assert rl.current_usage("hot") == 100
+    assert rl.current_usage("hot") == 50  # 恰好用满，未透支，拒绝的请求未记账
 
 
 # ---- HTTP 层测试 ----

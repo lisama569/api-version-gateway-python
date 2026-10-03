@@ -3,8 +3,8 @@
 一个**纯进程内**实现的对外 API 服务样板，聚焦三件让分布式调用结果“可预期、可解释”的事：
 
 1. **版本协商**：调用方按请求选择 API 版本；未声明 / 未知 / 已下线 / 已弃用的处理互不相同。
-2. **幂等写入**：同一幂等键的重复提交不产生重复副作用；并发重复请求最多一个生效。
-3. **配额限流**：按调用方 + 固定时间窗口计数；超限返回可用于重试的信息，并发不漏计、窗口切换无空档。
+2. **幂等写入**：同一幂等键的重复提交不产生重复副作用；并发重复请求最多一个生效；支持整批原子生效的批量下单。
+3. **配额限流**：按调用方 + 滑动时间窗口计量（批量按实际条数扣减）；超限返回可用于重试的信息，并发不透支、窗口边缘不翻倍。
 
 不依赖任何外部服务（无 Redis / 数据库 / 消息队列）或真实凭据；所有状态都在单进程内存中，适合本地验证与测试。
 
@@ -16,8 +16,11 @@
 # 依赖由 uv 管理（见 pyproject.toml / uv.lock）
 uv sync
 
-# 运行测试
+# 运行测试（-v 可看到每个用例的名称与结果；测试日志经 caplog 断言判定依据）
 uv run pytest
+uv run pytest -v
+# 只跑批量下单相关用例
+uv run pytest tests/test_batch.py -v
 
 # 启动服务
 uv run uvicorn main:app --reload
@@ -37,6 +40,7 @@ uv run uvicorn main:app --reload
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/orders` | 创建订单（写请求，**必须**带 `Idempotency-Key`） |
+| POST | `/orders/batch` | 批量创建订单（整批原子生效，配额按条数计） |
 | GET | `/orders/{id}` | 查询订单 |
 
 ### curl 示例
@@ -57,6 +61,20 @@ curl -i -X POST http://127.0.0.1:8000/orders \
 curl -i -X POST http://127.0.0.1:8000/orders \
   -H 'X-API-Version: 2023-01-01' -H 'Idempotency-Key: k-2' \
   -H 'Content-Type: application/json' -d '{"name":"pen"}'
+
+# 批量下单：整批原子生效，返回 applied 为实际生效条数
+curl -i -X POST http://127.0.0.1:8000/orders/batch \
+  -H 'X-API-Version: 2024-01-01' \
+  -H 'X-Caller-Id: alice' \
+  -H 'Idempotency-Key: batch-20261003-001' \
+  -H 'Content-Type: application/json' \
+  -d '{"orders":[{"name":"book","quantity":2},{"name":"pen"},{"name":"ruler"}]}'
+# → 201 {"orders":[...3 条...], "applied":3, ...}，本批占用 3 条配额
+# 同一 Idempotency-Key + 同样请求体重放 → 201 同一份订单列表，Idempotent-Replay: true，
+#   不重复写、不重复扣额度
+# 其中任一条不合法（如 {"name":123}）→ 400 invalid_request，details.errors 的 loc
+#   指出是第几条（如 ["orders",1,"name"]），整批一条都不写
+# 剩余额度不足整批 → 429 quota_exceeded，details 含 needed/remaining/retry_after_seconds
 ```
 
 ---
@@ -89,13 +107,13 @@ curl -i -X POST http://127.0.0.1:8000/orders \
 - `Warning: 299 - "... retired on <date>; please migrate to <successor>."`（HTTP 头只能用 ASCII，中文说明见响应体与日志）
 - `X-API-Version: <实际协商版本>`（所有业务响应都回显）
 
-管道顺序为 **版本协商 → 配额限流 → 幂等写入**：例如配额已耗尽时，若请求本身版本不合法，仍然先返回版本错误，避免错误原因被掩盖。
+管道顺序为 **版本协商 → 配额限流 → 幂等写入**：例如配额已耗尽时，若请求本身版本不合法，仍然先返回版本错误，避免错误原因被掩盖。唯一的例外是 `POST /orders/batch`：批内条数要解析请求体后才知道，且重放不应重复扣额度，因此批量端点在路由内按“幂等占位 → 赢家按条数扣减配额 → 整批写入”执行（详见第 4 节）。
 
 ---
 
 ## 3. 幂等写入语义
 
-- 所有 `POST /orders` 请求必须携带 **`Idempotency-Key`** 头，缺失返回 `400 idempotency_key_missing`。
+- 所有 `POST /orders` 与 `POST /orders/batch` 请求必须携带 **`Idempotency-Key`** 头，缺失返回 `400 idempotency_key_missing`。
 - 服务端对请求体计算规范化指纹（JSON 键排序后 SHA-256）：
   - **同键 + 同指纹**：重复提交，回放首次结论，不再次执行业务。
   - **同键 + 不同指纹**：`409 idempotency_conflict`，调用方键用错了，必须换键。
@@ -114,12 +132,32 @@ curl -i -X POST http://127.0.0.1:8000/orders \
 
 记录在定论后保留 TTL（默认 86400 秒，可在 `Settings` 配置）；`inflight` 记录不参与 TTL 回收，避免同进程内仍在执行的请求被新请求顶替。并发安全由占位/计数路径上的互斥锁保证（见 `tests/test_idempotency.py` 的多线程用例）。
 
+### 调用方之间的隔离
+
+- 幂等记录**按调用方隔离**：存储键 internally 为 `(caller, Idempotency-Key)`。两个调用方碰巧使用同一个幂等键时，各自独立占位、独立生效、各自重放各自的结果，不会串到对方（见 `tests/test_batch.py::test_same_key_different_callers_independent`）。
+- 配额同样只算在各自头上：一个调用方超限被拒，不影响其他调用方的额度（见 `test_quota_isolated_per_caller`）。
+
 ---
 
-## 4. 限流语义
+## 4. 批量下单语义
+
+`POST /orders/batch` 一次提交多条订单，请求体为 `{"orders": [...]}`（1–100 条）：
+
+- **原子性**：整批要么全部生效、要么一条都不生效。所有条目先整体校验，任一条不合法 → `400 invalid_request`，`details.errors` 的 `loc` 指出具体是哪一条（如 `["orders", 1, "name"]` 表示第 2 条的 `name` 字段），此时一条都不会写入；写入在同一把锁内一次完成，不存在“只写进去一半”的中间态。
+- **返回**：`201` 时响应体为 `{"orders": [...], "applied": N, "api_version": ...}`，`applied` 即本批实际生效条数。
+- **幂等**：整个请求体（含全部条目）计算一个指纹。同一幂等键 + 同一批内容重复提交 → 回放首次结论（同一份订单列表、同一个 `applied`），**不重复写、也不重复扣配额**；同键不同内容 → `409 idempotency_conflict`；并发同键请求同样最多一个生效。
+- **配额按条数计**：本批的配额占用 = 批内条数（`cost = len(orders)`），不是按请求次数。判定与扣减在限流器的同一把锁内原子完成：
+  - 剩余额度 ≥ 批内条数 → 整批放行并一次扣减；
+  - 剩余额度不足 → **整批拒绝**（`429 quota_exceeded`），一条不写、一分额度不扣；错误体 `details` 说明 `needed`（本次需要多少条）、`remaining`（当前还剩多少条）、`limit` / `window_seconds` 与 `retry_after_seconds`（预计多久后可重试，按“累计释放足够条数”的最早时刻估算），并带 `Retry-After` 头；若单批条数超过配额上限本身，`retry_after_seconds` 为 0，请拆分批次；
+  - 多个批量请求并发提交时，原子扣减保证成功占用合计不超过配额（见 `test_concurrent_batches_never_exceed_quota`）。
+- 配额拒绝会被记为该幂等键的失败结论（与单笔下单的失败语义一致）：同键重放得到 `idempotent_replay_quota_exceeded`，如需重试请**更换新幂等键**。
+
+---
+
+## 5. 限流语义
 
 - 调用方身份取自 **`X-Caller-Id`** 头；缺省为 `anonymous`。
-- 规则按调用方在 `config.py` 配置，固定时间窗口：
+- 规则按调用方在 `config.py` 配置，**滑动时间窗口**：
 
 | 调用方 | 窗口配额 | 窗口长度 |
 | --- | --- | --- |
@@ -128,17 +166,17 @@ curl -i -X POST http://127.0.0.1:8000/orders \
 | 其他具名调用方（默认） | 100 | 60s |
 | `anonymous` | 20 | 60s |
 
-- 计数与放行判定在同一把锁内**原子**完成：高并发下不会漏计/低估（100 并发、配额 50 的对拍见测试）。
-- **每个请求都计数**，包括被业务拒绝的请求、被限流的请求与幂等重放请求——无法用“故意打失败请求”或“超限后重试”刷出额外名额。
-- 窗口为左闭右开区间；落入新窗口的第一个请求原子滚动计数桶，旧窗口立即失效，不存在“新旧窗口同时放行”的切换空档。
+- 计量单位为**成功占用的额度**：普通端点每次请求计 1；`POST /orders/batch` 按批内实际生效条数计（见第 4 节）。判定与记账在同一把锁内**原子**完成：高并发下不会把额度用超（100 并发、配额 50 与 20 并发 × 每批 3 条的对拍见测试）。
+- **只有成功占用的请求才记账**：被限流拒绝的请求不消耗额度——超限后的重试既刷不出额外名额，也不会污染窗口内已有的占用。
+- 窗口为滑动窗口 `(now - window_seconds, now]`：只统计窗口内的成功占用，因此**任意一段 window_seconds 长度的时间内，占用合计都不超过配额**——窗口边缘的密集请求也无法像固定窗口那样借“切窗”瞬间翻倍（见 `test_sliding_window_edge_no_double_spend` 与 `test_window_edge_burst_cannot_exceed_quota`）。
 - 超限返回 `429 quota_exceeded`，并附可用于重试的信息：
   - 响应头 `Retry-After: <秒>`；
-  - 错误体 `details` 中含 `caller / limit / window_seconds / retry_after_seconds`；
-  - 所有业务响应都带 `X-RateLimit-Limit`、`X-RateLimit-Remaining`、`X-RateLimit-Reset`（距窗口重置秒数）。
+  - 错误体 `details` 中含 `caller / limit / window_seconds / retry_after_seconds`（批量场景另有 `needed / remaining`）；
+  - 所有业务响应都带 `X-RateLimit-Limit`、`X-RateLimit-Remaining`、`X-RateLimit-Reset`（距下一笔占用释放的秒数）。
 
 ---
 
-## 5. 错误响应格式
+## 6. 错误响应格式
 
 统一为：
 
@@ -157,25 +195,29 @@ curl -i -X POST http://127.0.0.1:8000/orders \
 `idempotency_key_missing` / `idempotency_conflict` / `idempotency_inflight` /
 `idempotent_replay_*` / `quota_exceeded` / `invalid_request` / `resource_not_found`。
 
-## 6. 日志（判定依据可解释）
+## 7. 日志（判定依据可解释）
 
 `api_gateway` logger 输出单行结构化日志（`event=... key=value`），关键事件：
 
 - `event=version_decision`：`result=supported|deprecated|rejected`，拒绝时带 `reason=...`，并打印 `requested/sunset_at/successor`；
-- `event=idempotency_decision`：打印 `idempotency_key`、请求体指纹前缀与 `outcome=acquired|completed|waiting|replay|failed`；
-- `event=quota_decision`：打印 `caller / used / limit / window_seconds / allowed / reset_in_seconds`。
+- `event=idempotency_decision`：打印 `idempotency_key`、请求体指纹前缀与 `outcome=acquired|completed|waiting|replay|failed`（批量请求另带 `batch_size`）；
+- `event=quota_decision`：打印 `caller / used / limit / window_seconds / allowed / reset_in_seconds`（批量请求另带 `cost`，即本批条数）；
+- `event=batch_decision`：批量请求的结论——`result=applied` 时带 `applied=<生效条数>`；`result=rejected` 时带 `reason=quota_exceeded` 与 `needed / remaining / retry_after_seconds`。
 
-## 7. 代码结构
+测试运行时的判定日志同样可被 `caplog` 捕获并断言（见 `tests/test_api.py`、`tests/test_batch.py` 的日志用例）；`uv run pytest -v` 会逐个列出用例名与结果。
+
+## 8. 代码结构
 
 ```
 gateway/
   config.py       # 版本注册表、配额规则、Settings（纯数据）
   errors.py       # 按拒绝原因区分的错误类型（状态码 + 错误码）
   versioning.py   # 版本协商
-  idempotency.py  # 幂等记录状态机（原子占位 + 等待回放 + TTL）
-  ratelimit.py    # 固定窗口计数（原子判定、窗口滚动）
-  resources.py    # Order 资源与写入服务（side_effects 计数体现真实副作用）
-  app.py          # FastAPI 装配：中间件管道 + 路由 + 统一错误体 + 日志
+  idempotency.py  # 幂等记录状态机（原子占位 + 等待回放 + TTL，按调用方隔离）
+  ratelimit.py    # 滑动窗口计量（按条数原子扣减、边缘不翻倍、拒绝不记账）
+  resources.py    # Order 资源与写入服务（单笔/批量原子写，side_effects 计真实副作用）
+  app.py          # FastAPI 装配：中间件管道 + 单笔/批量路由 + 统一错误体 + 日志
 main.py           # uvicorn 入口（main:app）
-tests/            # 版本协商 / 幂等（含并发）/ 限流（边界+并发+切窗）/ 端到端与日志
+tests/            # 版本协商 / 幂等（含并发）/ 限流（滑动窗口+按条计费+并发）/
+                  # 批量（原子性+配额+并发+隔离+窗口边缘）/ 端到端与日志
 ```

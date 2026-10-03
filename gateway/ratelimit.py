@@ -1,10 +1,14 @@
-"""固定时间窗口配额限流：并发计数不漏计，窗口切换不留空档。
+"""滑动时间窗口配额限流：任意窗口长度内成功占用的额度都不超限。
 
-每个调用方在内存中维护一个 (window_start, count) 计数桶：
-- 判定与自增在同一把锁内原子完成，并发请求不会漏计；
-- 桶的有效期为 [window_start, window_start + window_seconds)，
-  落在新窗口的第一个请求负责原子地滚动窗口，不存在“新旧窗口都放行”的空档；
-- 被拒绝的请求同样计入本窗口，避免超限后用重试刷穿配额。
+每个调用方在内存中维护一条“成功占用记录”日志（时间戳 + 占用条数）：
+- 判定与记账在同一把锁内原子完成，并发请求不会把额度用超；
+- 窗口为滑动窗口：只统计落在 (now - window_seconds, now] 内的成功占用，
+  因此任意一段 window_seconds 长度的时间内的占用合计都不超过配额，
+  窗口边缘的密集请求也无法利用“切窗”翻倍额度（固定窗口的缺陷）；
+- 只有成功占用的请求才记账：被限流拒绝的请求不消耗额度，
+  超限后的重试既不会刷穿配额，也不会影响窗口内已有的占用；
+- 支持按条数计费（cost>1）：批量请求按实际生效条数一次原子扣减，
+  剩余额度不足以覆盖整批时整体拒绝，不会先扣一部分再报超限。
 """
 
 from __future__ import annotations
@@ -12,8 +16,9 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Deque, Tuple
 
 from gateway.config import QuotaRule
 
@@ -34,13 +39,13 @@ class QuotaDecision:
 
 
 class RateLimiter:
-    """按调用方维护固定窗口计数。"""
+    """按调用方维护滑动窗口内的成功占用记录。"""
 
     def __init__(self, clock: Callable[[], float] | None = None) -> None:
         self._clock = clock or time.monotonic
         self._lock = threading.Lock()
-        # caller -> (窗口起点, 已计次数)
-        self._counters: dict[str, tuple[float, int]] = {}
+        # caller -> 按时间升序的 (占用时间, 占用条数) 日志，仅含成功占用
+        self._usage: dict[str, Deque[Tuple[float, int]]] = {}
 
     def check(
         self,
@@ -49,42 +54,86 @@ class RateLimiter:
         cost: int = 1,
         now: float | None = None,
     ) -> QuotaDecision:
-        """计数并判定是否放行。拒绝时 retry_after_seconds 为距窗口重置的秒数。"""
+        """判定并（放行时）原子记账。拒绝时 retry_after_seconds 为预计可重试的秒数。
+
+        cost 为本次请求实际要占用的条数（批量场景为批内条数）；
+        只有放行才会记账，被拒绝的请求不消耗任何额度。
+        """
+        if cost < 1:
+            raise ValueError("cost 必须为正整数")
         if now is None:
             now = self._clock()
         with self._lock:
-            started, count = self._counters.get(caller, (now, 0))
-            # 落入新窗口：原子滚动，旧计数立即失效且新窗口从 0 开始
-            if now - started >= rule.window_seconds:
-                started, count = now, 0
-            count += cost
-            self._counters[caller] = (started, count)
+            entries = self._usage.setdefault(caller, deque())
+            self._evict(entries, rule.window_seconds, now)
+            active = sum(amount for _, amount in entries)
+            allowed = active + cost <= rule.limit
+            if allowed:
+                entries.append((now, cost))
+                active_after = active + cost
+            else:
+                active_after = active
 
-        reset_at = started + rule.window_seconds
-        allowed = count <= rule.limit
-        remaining = max(0, rule.limit - count)
-        retry_after = 0.0 if allowed else max(0.0, math.ceil(reset_at - now))
+        used = active + cost  # 含本次尝试，便于观测“超限到了什么程度”
+        # remaining 始终表示当前真实剩余额度：放行时为扣减后的余量，拒绝时为现有余量
+        remaining = max(0, rule.limit - active_after)
+        window_started_at = entries[0][0] if entries else now
+        reset_at = (entries[0][0] + rule.window_seconds) if entries else now + rule.window_seconds
+        retry_after = 0.0 if allowed else self._retry_after(entries, rule, cost, now)
         return QuotaDecision(
             caller=caller,
             allowed=allowed,
             limit=rule.limit,
-            used=count,
+            used=used,
             remaining=remaining,
             window_seconds=rule.window_seconds,
-            window_started_at=started,
+            window_started_at=window_started_at,
             reset_at=reset_at,
             retry_after_seconds=retry_after,
         )
 
-    def current_usage(self, caller: str) -> int | None:
-        """返回调用方当前窗口已计次数（主要用于可观测/测试）。"""
+    def current_usage(self, caller: str, rule: QuotaRule | None = None) -> int | None:
+        """返回调用方当前窗口内成功占用的条数（主要用于可观测/测试）。
+
+        传入 rule 时先按窗口长度做一次过期清理，否则返回原始日志合计。
+        """
         with self._lock:
-            bucket = self._counters.get(caller)
-            return bucket[1] if bucket is not None else None
+            entries = self._usage.get(caller)
+            if entries is None:
+                return None
+            if rule is not None:
+                self._evict(entries, rule.window_seconds, self._clock())
+            return sum(amount for _, amount in entries)
 
     def reset(self, caller: str | None = None) -> None:
         with self._lock:
             if caller is None:
-                self._counters.clear()
+                self._usage.clear()
             else:
-                self._counters.pop(caller, None)
+                self._usage.pop(caller, None)
+
+    @staticmethod
+    def _evict(entries: Deque[Tuple[float, int]], window_seconds: float, now: float) -> None:
+        """移除已滑出窗口的记录：窗口为 (now - window_seconds, now]。"""
+        cutoff = now - window_seconds
+        while entries and entries[0][0] <= cutoff:
+            entries.popleft()
+
+    @staticmethod
+    def _retry_after(
+        entries: Deque[Tuple[float, int]], rule: QuotaRule, cost: int, now: float
+    ) -> float:
+        """估算还需等待多少秒才有足够额度：按时间顺序累计即将过期释放的条数。
+
+        若 cost 本身已超过配额上限（等多久都不够），返回 0.0 交由上层提示拆分。
+        """
+        if cost > rule.limit:
+            return 0.0
+        active = sum(amount for _, amount in entries)
+        need_to_free = active + cost - rule.limit
+        freed = 0
+        for ts, amount in entries:
+            freed += amount
+            if freed >= need_to_free:
+                return max(0.0, math.ceil(ts + rule.window_seconds - now))
+        return 0.0  # pragma: no cover - 防御：理论上有 need_to_free 必能凑齐
