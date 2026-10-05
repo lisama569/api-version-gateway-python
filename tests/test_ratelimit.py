@@ -97,14 +97,27 @@ def test_cost_based_accounting_atomic():
 
 
 def test_cost_exceeding_limit_never_fits():
-    """单批条数超过配额上限：等多久都不够，retry_after=0 交由上层提示拆分。"""
+    """单批条数超过配额上限：等多久都不够，exceeds_limit=True 交由上层提示拆分。"""
     t = 0.0
     rl = RateLimiter(clock=lambda: t)
     rule = QuotaRule(limit=2, window_seconds=10.0)
     d = rl.check("c", rule, cost=5)
     assert not d.allowed
     assert d.retry_after_seconds == 0.0
+    assert d.exceeds_limit is True
     assert rl.current_usage("c") == 0
+
+
+def test_cost_within_limit_but_window_full_is_temporary():
+    """条数本身不超上限、只是窗口暂满：exceeds_limit=False，retry_after>0 可等待恢复。"""
+    t = 0.0
+    rl = RateLimiter(clock=lambda: t)
+    rule = QuotaRule(limit=3, window_seconds=10.0)
+    assert rl.check("c", rule, cost=2).allowed
+    d = rl.check("c", rule, cost=2)  # 需要 2 条，窗口只剩 1 条，但 2 ≤ 上限 3
+    assert not d.allowed
+    assert d.exceeds_limit is False
+    assert d.retry_after_seconds > 0
 
 
 def test_retry_after_points_to_earliest_sufficient_release():

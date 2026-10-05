@@ -1,9 +1,12 @@
 """批量下单：整批原子生效、按条数计配额、并发不透支、调用方隔离、窗口边缘不超额。
 
 覆盖的新增业务行为：
-- 原子性：一批多条要么全部生效、要么一条不生效；非法条目整批拒绝并定位到具体条目；
+- 原子性：一批多条要么全部生效、要么一条不生效；非法条目（空名字、非正数量）整批
+  拒绝并定位到具体条目；
 - 幂等：同键同批重放复用首次结果（不重复写、不重复扣额度），同键不同内容 409；
-- 配额：按批内条数扣减；余额不足整批拒绝并给出 needed/remaining/retry_after；
+- 配额：按批内条数扣减；余额暂时不足整批拒绝并给出 needed/remaining/retry_after，
+  且该失败不锁死结论——窗口恢复后用同一个幂等键重试会重新判定（额度够则 201）；
+- 超限批次：单批条数超过整窗配额上限时返回 422 batch_too_large，提示拆批而非重试；
 - 并发：多批量请求并发提交不透支额度；
 - 隔离：不同调用方同幂等键各自独立，配额互不影响；
 - 窗口：滑动窗口下窗口边缘的密集请求也不能超额。
@@ -51,6 +54,41 @@ def test_batch_with_invalid_item_rejected_entirely(client):
     locs = [e["loc"] for e in err["details"]["errors"]]
     assert any(list(loc[:2]) == ["orders", 1] for loc in locs)  # 指出是第 2 条（下标 1）
     assert state.orders.side_effects == 0  # 不存在只写一半的中态
+
+
+def test_batch_with_empty_name_rejected_entirely(client):
+    """条目名字为空串或纯空白 → 整批 400 一条不写，loc 指出是第几条的 name。"""
+    state = client.app.state.gateway
+    for idx, bad_name in enumerate(("", "   ", "\t\n")):
+        state.orders._orders.clear()
+        state.orders.side_effects = 0
+        bad = {"orders": [{"name": "ok"}, {"name": bad_name}, {"name": "also-ok"}]}
+        r = client.post("/orders/batch", json=bad, headers=batch_headers(H, f"b-empty-name-{idx}"))
+        assert r.status_code == 400, bad_name
+        err = r.json()["error"]
+        assert err["code"] == "invalid_request"
+        locs = [tuple(e["loc"]) for e in err["details"]["errors"]]
+        # 第 2 条（下标 1）的 name 字段有问题
+        assert any(loc[:3] == ("orders", 1, "name") for loc in locs), locs
+        assert state.orders.side_effects == 0
+
+
+def test_batch_with_non_positive_quantity_rejected_entirely(client):
+    """数量为 0 或负数 → 整批 400 一条不写，loc 指出是第几条的 quantity。"""
+    state = client.app.state.gateway
+    for bad_qty in (0, -1, -99):
+        state.orders._orders.clear()
+        state.orders.side_effects = 0
+        bad = {"orders": [{"name": "ok", "quantity": 2}, {"name": "bad", "quantity": bad_qty}]}
+        r = client.post("/orders/batch", json=bad, headers=batch_headers(H, f"b-qty-{bad_qty}"))
+        assert r.status_code == 400, bad_qty
+        err = r.json()["error"]
+        assert err["code"] == "invalid_request"
+        locs = [tuple(e["loc"]) for e in err["details"]["errors"]]
+        assert any(loc[:3] == ("orders", 1, "quantity") for loc in locs), locs
+        assert state.orders.side_effects == 0
+        # 被判非法的批次不能算作已生效：配额也没有任何占用
+        assert (state.limiter.current_usage("premium") or 0) == 0
 
 
 def test_empty_batch_rejected(client):
@@ -111,7 +149,7 @@ def test_batch_quota_charged_per_item(client):
 
 
 def test_batch_rejected_when_quota_insufficient(client):
-    """剩余额度不足整批：整批 429，一条不写，并说明需要多少/剩多少/何时重试。"""
+    """剩余额度暂时不足整批：整批 429，一条不写，并说明需要多少/剩多少/何时重试。"""
     state = client.app.state.gateway
     # trial 配额 3 条：先用掉 2 条
     assert client.post(
@@ -133,9 +171,127 @@ def test_batch_rejected_when_quota_insufficient(client):
     assert details["remaining"] == 1
     assert details["limit"] == 3
     assert details["retry_after_seconds"] > 0
+    assert details["retryable"] is True
+    assert details["retry_with_same_idempotency_key"] is True
     assert r.headers["Retry-After"]
     assert state.orders.side_effects == 2          # 一条都没多写
     assert state.limiter.current_usage("trial") == 2  # 拒绝不扣额度
+
+
+def test_batch_quota_rejection_retried_same_key_before_window_still_denied(client, clock):
+    """窗口尚未恢复时用同一幂等键立即重试：重新判定而非回放旧结论，仍 429、仍不写入。"""
+    state = client.app.state.gateway
+    # 先占满 trial 的 3 条窗口额度
+    assert client.post(
+        "/orders/batch",
+        json={"orders": [{"name": "f1"}, {"name": "f2"}, {"name": "f3"}]},
+        headers=batch_headers(TRIAL, "q-retry-early-fill"),
+    ).status_code == 201
+    body = {"orders": [{"name": "a"}, {"name": "b"}, {"name": "c"}]}
+    headers = batch_headers(TRIAL, "q-retry-early")
+    r1 = client.post("/orders/batch", json=body, headers=headers)
+    assert r1.status_code == 429
+    assert r1.json()["error"]["code"] == "quota_exceeded"
+    assert state.orders.side_effects == 3
+
+    # 窗口只过了 30s（不足 60s），同键同体重试 → 再次真实判定，仍是新的 429，
+    # 而不是 idempotent_replay_quota_exceeded 的失败回放
+    clock.advance(30)
+    r2 = client.post("/orders/batch", json=body, headers=headers)
+    assert r2.status_code == 429
+    assert r2.json()["error"]["code"] == "quota_exceeded"
+    assert "Idempotent-Replay" not in r2.headers  # 不是回放
+    assert state.orders.side_effects == 3         # 拒绝的批次没有多写一条
+    assert state.limiter.current_usage("trial") == 3  # 占用仍只有填充批
+
+
+def test_batch_quota_rejection_retried_same_key_after_window_succeeds(client, clock):
+    """核心回归：额度不足被拒后，窗口恢复，用同一幂等键+同一批内容重试应 201 生效。
+
+    旧实现把配额拒绝永久记为 failed，同键重试只能拿到第一次拒绝的回放，永远无法生效。
+    """
+    state = client.app.state.gateway
+    body = {"orders": [{"name": "a"}, {"name": "b"}, {"name": "c"}]}
+    headers = batch_headers(TRIAL, "q-retry-recover")
+
+    # 第一次：trial 窗口额度 3 条，已被其他请求占满 → 本批 429，无任何写入
+    fill = client.post(
+        "/orders/batch",
+        json={"orders": [{"name": "fill1"}, {"name": "fill2"}, {"name": "fill3"}]},
+        headers=batch_headers(TRIAL, "q-fill"),
+    )
+    assert fill.status_code == 201
+    r1 = client.post("/orders/batch", json=body, headers=headers)
+    assert r1.status_code == 429
+    assert r1.json()["error"]["code"] == "quota_exceeded"
+    assert state.orders.side_effects == 3  # 只有占满窗口的那批生效
+
+    # 窗口滑过：占用全部释放，额度完整恢复
+    clock.advance(60.1)
+
+    # 同一幂等键、同一批内容重试 → 重新判定，额度已够，整批真正生效
+    r2 = client.post("/orders/batch", json=body, headers=headers)
+    assert r2.status_code == 201, r2.text
+    applied = r2.json()
+    assert applied["applied"] == 3
+    assert len(applied["orders"]) == 3
+    assert [o["name"] for o in applied["orders"]] == ["a", "b", "c"]
+    assert r2.headers["Idempotent-Replay"] == "false"  # 是新执行，不是回放
+    assert state.orders.side_effects == 6  # 真正多写了 3 条
+    assert state.limiter.current_usage("trial") == 3
+
+    # 生效之后再用同一键重放 → 回到标准幂等回放（不重复写、不重复扣额度）
+    r3 = client.post("/orders/batch", json=body, headers=headers)
+    assert r3.status_code == 201
+    assert r3.headers["Idempotent-Replay"] == "true"
+    assert [o["id"] for o in r3.json()["orders"]] == [o["id"] for o in applied["orders"]]
+    assert state.orders.side_effects == 6
+    assert state.limiter.current_usage("trial") == 3
+
+
+def test_batch_too_large_for_window_distinguished_from_temporary_shortage(client):
+    """单批条数超过整窗配额上限：422 batch_too_large，明确要求拆批，不给立即重试指引。"""
+    state = client.app.state.gateway
+    # trial 窗口上限 3 条，直接提交 4 条——无论等多久都不可能整批放行
+    body = {"orders": [{"name": f"n{i}"} for i in range(4)]}
+    r = client.post("/orders/batch", json=body, headers=batch_headers(TRIAL, "q-huge"))
+    assert r.status_code == 422
+    err = r.json()["error"]
+    assert err["code"] == "batch_too_large"
+    details = err["details"]
+    assert details["needed"] == 4
+    assert details["limit"] == 3
+    assert details["retryable"] is False
+    assert details["remediation"] == "split_into_smaller_batches"
+    assert details["max_batch_size"] == 3
+    assert "拆" in err["message"]
+    assert "Retry-After" not in r.headers  # 不提供“马上重试”的提示
+    assert state.orders.side_effects == 0
+    assert state.limiter.current_usage("trial") == 0  # 拒绝不记账
+
+
+def test_batch_too_large_replay_keeps_decision_and_same_key_never_helps(client, clock):
+    """超限批次是永久性结论：同键重放仍 422；拆小 + 换新键后才可能成功。"""
+    state = client.app.state.gateway
+    body = {"orders": [{"name": f"n{i}"} for i in range(4)]}
+    headers = batch_headers(TRIAL, "q-huge-replay")
+    r1 = client.post("/orders/batch", json=body, headers=headers)
+    assert r1.status_code == 422
+    clock.advance(120)  # 即使过再多窗口也放不下
+    r2 = client.post("/orders/batch", json=body, headers=headers)
+    assert r2.status_code == 422
+    assert r2.json()["error"]["code"] == "idempotent_replay_batch_too_large"
+    assert r2.headers["Idempotent-Replay"] == "true"
+    assert state.orders.side_effects == 0
+
+    # 拆成不超过上限的小批次，并使用新幂等键 → 正常生效
+    ok = client.post(
+        "/orders/batch",
+        json={"orders": [{"name": "n0"}, {"name": "n1"}, {"name": "n2"}]},
+        headers=batch_headers(TRIAL, "q-huge-split-1"),
+    )
+    assert ok.status_code == 201
+    assert ok.json()["applied"] == 3
 
 
 def test_concurrent_batches_never_exceed_quota(client):

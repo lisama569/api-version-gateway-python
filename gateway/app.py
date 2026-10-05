@@ -13,7 +13,7 @@ from typing import Any, Callable
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from gateway.config import QuotaRule, Settings, VersionStatus, default_settings
 from gateway.errors import (
@@ -25,6 +25,7 @@ from gateway.idempotency import (
     ACQUIRED,
     COMPLETED,
     INFLIGHT,
+    RETRYABLE,
     IdempotencyEntry,
     IdempotencyStore,
     fingerprint_payload,
@@ -60,6 +61,22 @@ class CreateOrderBody(BaseModel):
     name: str
     quantity: int = 1
     amount: int = 0
+
+    @field_validator("name")
+    @classmethod
+    def _name_must_be_non_empty(cls, value: str) -> str:
+        """名字不能为空串或纯空白；loc 仍指向具体字段（批量时可定位到第几条）。"""
+        if not value or not value.strip():
+            raise ValueError("name 不能为空或纯空白字符。")
+        return value
+
+    @field_validator("quantity")
+    @classmethod
+    def _quantity_must_be_positive(cls, value: int) -> int:
+        """下单数量必须为正整数（0 与负数不合法）。"""
+        if value <= 0:
+            raise ValueError("quantity 必须为正整数（大于 0）。")
+        return value
 
 
 class BatchCreateOrderBody(BaseModel):
@@ -138,6 +155,21 @@ def _error_payload(code: str, message: str, details: dict[str, Any]) -> dict[str
     return {"error": {"code": code, "message": message, "details": details}}
 
 
+def _invalid_request_response(errors: list[dict[str, Any]]) -> JSONResponse:
+    """构造 400 invalid_request 响应（errors 的 loc 可定位到批量条目的具体下标）。"""
+    # pydantic v2 的 value_error 项 ctx 中含原始异常对象，不能直接 JSON 序列化
+    safe_errors = [
+        {k: v for k, v in err.items() if k != "ctx"} if isinstance(err, dict) else err
+        for err in errors
+    ]
+    return JSONResponse(
+        status_code=400,
+        content=_error_payload(
+            "invalid_request", "请求体或参数不合法。", {"errors": safe_errors}
+        ),
+    )
+
+
 def _register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(GatewayError)
     async def _on_gateway_error(_: Request, exc: GatewayError) -> JSONResponse:
@@ -148,12 +180,7 @@ def _register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def _on_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
-        return JSONResponse(
-            status_code=400,
-            content=_error_payload(
-                "invalid_request", "请求体或参数不合法。", {"errors": exc.errors()}
-            ),
-        )
+        return _invalid_request_response(exc.errors())
 
 
 def _register_middleware(app: FastAPI, state: GatewayState, clock: Callable[[], float]) -> None:
@@ -311,11 +338,11 @@ def _register_routes(app: FastAPI, state: GatewayState) -> None:
             raw_body = await request.json()
             body = CreateOrderBody.model_validate(raw_body)
         except ValidationError as exc:
-            raise RequestValidationError(exc.errors()) from exc
+            return _invalid_request_response(exc.errors())
         except ValueError as exc:
-            raise RequestValidationError(
+            return _invalid_request_response(
                 [{"type": "json_invalid", "loc": ["body"], "msg": "请求体必须是合法 JSON。"}]
-            ) from exc
+            )
         payload = body.model_dump()
         fingerprint = fingerprint_payload(payload)
         scoped_key = scoped_idempotency_key(caller, key)
@@ -329,14 +356,25 @@ def _register_routes(app: FastAPI, state: GatewayState) -> None:
             caller=caller,
         )
 
-        if outcome == ACQUIRED:
-            return _execute_with_idempotency(state, scoped_key, key, caller, version, payload)
-
         if outcome == INFLIGHT:
             waited = _wait_for_inflight(state, scoped_key, key)
             if isinstance(waited, JSONResponse):
                 return waited
             outcome = waited.status
+
+        if outcome == RETRYABLE:
+            # 首个请求此前因可恢复条件失败且未产生副作用：本次重新占位、重新判定
+            outcome = state.idempotency.acquire(scoped_key, fingerprint)
+            log_event(
+                "idempotency_decision",
+                idempotency_key=key,
+                fingerprint=fingerprint[:12],
+                outcome="reacquired_after_retryable",
+                caller=caller,
+            )
+
+        if outcome == ACQUIRED:
+            return _execute_with_idempotency(state, scoped_key, key, caller, version, payload)
 
         return _replay_idempotent_result(scoped_key, key, outcome, state)
 
@@ -359,15 +397,17 @@ def _register_routes(app: FastAPI, state: GatewayState) -> None:
             body = BatchCreateOrderBody.model_validate(raw_body)
         except ValidationError as exc:
             # errors 的 loc 含条目下标（如 ["orders", 2, "name"]），可定位到具体哪一条
-            raise RequestValidationError(exc.errors()) from exc
+            return _invalid_request_response(exc.errors())
         except ValueError as exc:
-            raise RequestValidationError(
+            return _invalid_request_response(
                 [{"type": "json_invalid", "loc": ["body"], "msg": "请求体必须是合法 JSON。"}]
-            ) from exc
+            )
         payloads = [item.model_dump() for item in body.orders]
         fingerprint = fingerprint_payload({"orders": payloads})
         scoped_key = scoped_idempotency_key(caller, key)
 
+        # 可恢复失败（窗口额度暂时不足）不锁定结论：同键同体再次提交重新走完整判定。
+        # 极端情况下若等待期间首个请求已落定为可重试失败，则立刻重新占位再试一次。
         outcome = state.idempotency.acquire(scoped_key, fingerprint)
         log_event(
             "idempotency_decision",
@@ -378,14 +418,26 @@ def _register_routes(app: FastAPI, state: GatewayState) -> None:
             batch_size=len(payloads),
         )
 
-        if outcome == ACQUIRED:
-            return _execute_batch(state, request, scoped_key, key, caller, version, payloads)
-
         if outcome == INFLIGHT:
             waited = _wait_for_inflight(state, scoped_key, key)
             if isinstance(waited, JSONResponse):
                 return waited
             outcome = waited.status
+
+        if outcome == RETRYABLE:
+            # 首个请求此前因可恢复条件失败且未产生副作用：本次重新占位、重新判定
+            outcome = state.idempotency.acquire(scoped_key, fingerprint)
+            log_event(
+                "idempotency_decision",
+                idempotency_key=key,
+                fingerprint=fingerprint[:12],
+                outcome="reacquired_after_retryable",
+                caller=caller,
+                batch_size=len(payloads),
+            )
+
+        if outcome == ACQUIRED:
+            return _execute_batch(state, request, scoped_key, key, caller, version, payloads)
 
         return _replay_idempotent_result(scoped_key, key, outcome, state)
 
@@ -445,7 +497,10 @@ def _execute_batch(
     """批量幂等占位赢家路径：先按条数原子扣减额度，再一次原子写入整批。
 
     顺序保证：只有占位赢家才会扣额度（重放不重复计费）；
-    额度不足时整批拒绝、一条不写，并把失败结论记入幂等记录。
+    额度不足时整批拒绝、一条不写。拒绝分两类：
+    - 单批条数超过整窗配额上限：结论永久锁定（fail），调用方必须拆批并用新键提交；
+    - 窗口内剩余额度暂时不足：记为“可重试失败”（fail_retryable），本次无任何副作用，
+      窗口恢复后用同一个幂等键与同一批内容重试会重新走完整判定，而不是回放旧拒绝。
     """
     cost = len(payloads)
     rule: QuotaRule = request.state.quota_rule
@@ -462,8 +517,43 @@ def _execute_batch(
         window_seconds=quota.window_seconds,
         reset_in_seconds=quota.retry_after_seconds,
     )
+    if not quota.allowed and quota.exceeds_limit:
+        # 永远放不下的批次：等待没有意义，明确要求拆成更小的批次
+        state.idempotency.fail(scoped_key, "batch_too_large", 422)
+        log_event(
+            "batch_decision",
+            idempotency_key=raw_key,
+            caller=caller,
+            result="rejected",
+            reason="batch_too_large",
+            needed=cost,
+            limit=quota.limit,
+            remaining=quota.remaining,
+        )
+        return JSONResponse(
+            status_code=422,
+            content=_error_payload(
+                "batch_too_large",
+                f"本批共 {cost} 条，已超过调用方 {caller} 在 {quota.window_seconds:g}s 窗口内"
+                f"可用的配额上限（{quota.limit} 条）：无论等待多久都不可能整批放行。"
+                f"请拆分为每批不超过 {quota.limit} 条的多个批次，并为每个小批次使用新的"
+                "幂等键分别提交，不要立即原样重试。",
+                {
+                    "caller": caller,
+                    "needed": cost,
+                    "limit": quota.limit,
+                    "remaining": quota.remaining,
+                    "window_seconds": quota.window_seconds,
+                    "max_batch_size": min(quota.limit, MAX_BATCH_SIZE),
+                    "retryable": False,
+                    "remediation": "split_into_smaller_batches",
+                },
+            ),
+        )
     if not quota.allowed:
-        state.idempotency.fail(scoped_key, QuotaExceededError.error_code, 429)
+        # 暂时性额度不足：本次一条不写、一分不扣；标记为可重试失败，
+        # 窗口释放出足够额度后，同一个幂等键 + 同一批内容会被重新判定。
+        state.idempotency.fail_retryable(scoped_key, QuotaExceededError.error_code, 429)
         log_event(
             "batch_decision",
             idempotency_key=raw_key,
@@ -473,14 +563,17 @@ def _execute_batch(
             needed=cost,
             remaining=quota.remaining,
             retry_after_seconds=quota.retry_after_seconds,
+            retryable="true",
         )
         return JSONResponse(
             status_code=429,
             content=_error_payload(
                 QuotaExceededError.error_code,
-                f"调用方 {caller} 剩余额度不足以覆盖整批：本次需要 {cost} 条，"
+                f"调用方 {caller} 剩余额度暂时不足以覆盖整批：本次需要 {cost} 条，"
                 f"当前剩余 {quota.remaining} 条（窗口配额 {quota.limit} 条/"
-                f"{quota.window_seconds:g}s），约 {quota.retry_after_seconds:.0f} 秒后可重试。",
+                f"{quota.window_seconds:g}s），约 {quota.retry_after_seconds:.0f} 秒后窗口将释放出"
+                "足够额度。本次未写入任何订单；届时请用同一个幂等键和同一批内容重试，"
+                "服务端会重新判定：额度已恢复则整批生效，仍不足则继续拒绝。",
                 {
                     "caller": caller,
                     "needed": cost,
@@ -488,6 +581,8 @@ def _execute_batch(
                     "limit": quota.limit,
                     "window_seconds": quota.window_seconds,
                     "retry_after_seconds": quota.retry_after_seconds,
+                    "retryable": True,
+                    "retry_with_same_idempotency_key": True,
                 },
             ),
             headers={"Retry-After": str(int(quota.retry_after_seconds))},

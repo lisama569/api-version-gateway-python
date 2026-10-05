@@ -11,6 +11,7 @@ from gateway.idempotency import (
     COMPLETED,
     FAILED,
     INFLIGHT,
+    RETRYABLE,
     IdempotencyStore,
     fingerprint_payload,
 )
@@ -49,6 +50,40 @@ def test_failed_first_request_is_replayable_and_creates_no_side_effect():
     assert store.acquire("k", fp) == FAILED
     entry = store.get_result("k")
     assert entry.error_code == "boom" and entry.status_code == 500
+
+
+def test_retryable_failure_allows_same_key_to_reacquire():
+    """可恢复失败（如窗口额度暂时不足）：同键同体再次提交重新占位并重跑判定。"""
+    store = IdempotencyStore(ttl_seconds=3600)
+    fp = fingerprint_payload(PAYLOAD)
+
+    # 第一次占位 → 因可恢复条件失败
+    assert store.acquire("k", fp) == ACQUIRED
+    store.fail_retryable("k", "quota_exceeded", 429)
+    first_entry = store.get_result("k")
+    assert first_entry.status == RETRYABLE
+    assert first_entry.error_code == "quota_exceeded"
+
+    # 同键同体再次提交 → 不是回放，而是重新占位（由调用方重新执行业务）
+    assert store.acquire("k", fp) == ACQUIRED
+    second_entry = store.get_result("k")
+    assert second_entry.status == INFLIGHT  # 全新的 inflight 记录
+    assert second_entry is not first_entry
+
+    # 条件恢复后成功：后续重放拿到成功结论
+    store.complete("k", {"order": {"id": "o2"}}, 201)
+    assert store.acquire("k", fp) == COMPLETED
+    assert store.get_result("k").response["order"]["id"] == "o2"
+
+
+def test_retryable_failure_still_conflicts_on_different_fingerprint():
+    """retryable 记录仍然校验指纹：同键不同内容依旧 409。"""
+    store = IdempotencyStore(ttl_seconds=3600)
+    fp = fingerprint_payload(PAYLOAD)
+    assert store.acquire("k", fp) == ACQUIRED
+    store.fail_retryable("k", "quota_exceeded", 429)
+    with pytest.raises(IdempotencyConflictError):
+        store.acquire("k", fingerprint_payload({"name": "other"}))
 
 
 def test_concurrent_duplicates_exactly_one_wins():

@@ -55,6 +55,17 @@ class QuotaExceededError(GatewayError):
     error_code = "quota_exceeded"
 
 
+class BatchTooLargeError(GatewayError):
+    """单批条数超过整段窗口的配额上限：无论等待多久都放不下，必须拆批。
+
+    与“窗口内额度暂时不足”（429 quota_exceeded + 可重试时间）刻意区分：
+    本错误不携带 Retry-After，调用方应缩小单批条数而不是立刻重试。
+    """
+
+    status_code = 422
+    error_code = "batch_too_large"
+
+
 class ResourceNotFoundError(GatewayError):
     """资源不存在。"""
 

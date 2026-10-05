@@ -194,6 +194,21 @@ def test_malformed_json_rejected_as_invalid_request(client):
     assert r.json()["error"]["code"] == "invalid_request"
 
 
+def test_single_order_empty_name_or_non_positive_quantity_rejected(client):
+    """单笔下单与批量共用同一套条目校验：空名字 / 非正数量一律 400 且不产生写入。"""
+    state = client.app.state.gateway
+    for idx, payload in enumerate(
+        ({"name": ""}, {"name": "   "}, {"name": "ok", "quantity": 0},
+         {"name": "ok", "quantity": -3})
+    ):
+        r = client.post(
+            "/orders", json=payload, headers={**H, "Idempotency-Key": f"bad-item-{idx}"}
+        )
+        assert r.status_code == 400, payload
+        assert r.json()["error"]["code"] == "invalid_request"
+    assert state.orders.side_effects == 0
+
+
 def test_rate_limit_reset_header_present_on_allowed_responses(client):
     r = client.get("/orders/x", headers=H)
     assert r.headers["X-RateLimit-Limit"] == "1000"

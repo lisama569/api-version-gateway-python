@@ -36,6 +36,9 @@ class QuotaDecision:
     window_started_at: float
     reset_at: float
     retry_after_seconds: float
+    # 本次需要的条数本身已超过窗口配额上限：无论等待多久、窗口怎么滚动都放不下，
+    # 调用方必须拆成更小的批次，而不是按 Retry-After 反复重试。
+    exceeds_limit: bool = False
 
 
 class RateLimiter:
@@ -67,6 +70,7 @@ class RateLimiter:
             entries = self._usage.setdefault(caller, deque())
             self._evict(entries, rule.window_seconds, now)
             active = sum(amount for _, amount in entries)
+            exceeds_limit = cost > rule.limit
             allowed = active + cost <= rule.limit
             if allowed:
                 entries.append((now, cost))
@@ -79,7 +83,13 @@ class RateLimiter:
         remaining = max(0, rule.limit - active_after)
         window_started_at = entries[0][0] if entries else now
         reset_at = (entries[0][0] + rule.window_seconds) if entries else now + rule.window_seconds
-        retry_after = 0.0 if allowed else self._retry_after(entries, rule, cost, now)
+        if allowed:
+            retry_after = 0.0
+        elif exceeds_limit:
+            # 永远放不下：等待无意义，retry_after 为 0，上层应提示拆分批次
+            retry_after = 0.0
+        else:
+            retry_after = self._retry_after(entries, rule, cost, now)
         return QuotaDecision(
             caller=caller,
             allowed=allowed,
@@ -90,6 +100,7 @@ class RateLimiter:
             window_started_at=window_started_at,
             reset_at=reset_at,
             retry_after_seconds=retry_after,
+            exceeds_limit=exceeds_limit,
         )
 
     def current_usage(self, caller: str, rule: QuotaRule | None = None) -> int | None:
