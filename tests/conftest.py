@@ -66,3 +66,30 @@ def client(settings: Settings, clock: FakeClock):
     # 避免 StreamHandler 在测试运行时重复打印；caplog 仍可经传播捕获记录
     logging.getLogger("api_gateway").handlers[:] = []
     return TestClient(app)
+
+
+# ---- 用例级结果日志：跑单测时能看出每个用例覆盖的业务与结果 ----
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    """把各阶段报告挂到 item 上，供 log_case_result 夹具读取最终结果。"""
+    report = (yield)
+    setattr(item, f"rep_{report.when}", report)
+    return report
+
+
+@pytest.fixture(autouse=True)
+def log_case_result(request):
+    """每个用例结束都打印一条结构化日志：用例名 + 结果（passed/failed/skipped）。
+
+    配合 `uv run pytest -v --log-cli-level=INFO` 可在测试输出中直接看到
+    每个用例覆盖了什么业务、结论如何；业务判定细节由网关自身的
+    version/quota/idempotency/batch 决策日志体现（可被 caplog 断言）。
+    """
+    from gateway.app import log_event
+
+    yield
+    report = getattr(request.node, "rep_call", None)
+    result = report.outcome if report is not None else "unknown"
+    log_event("test_case", case=request.node.name, result=result)

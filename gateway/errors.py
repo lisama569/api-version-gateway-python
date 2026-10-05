@@ -55,6 +55,13 @@ class QuotaExceededError(GatewayError):
     error_code = "quota_exceeded"
 
 
+class BatchExceedsQuotaLimitError(GatewayError):
+    """单批条数超过整段窗口配额上限：等多久都放不下，必须拆批。"""
+
+    status_code = 400
+    error_code = "batch_exceeds_quota_limit"
+
+
 class ResourceNotFoundError(GatewayError):
     """资源不存在。"""
 

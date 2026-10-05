@@ -4,11 +4,15 @@
 
     (不存在) --acquire(指纹一致)--> inflight --complete--> completed
                                    inflight --fail------> failed
+                                   inflight --release---> (删除，可重试拒绝不留痕)
 
 并发到达的重复请求：
 - 第一个请求占位成功（ACQUIRED），真正执行副作用；
 - 其余请求得到 INFLIGHT，阻塞等待首个请求的结论；
 - 首个请求完成后，等待者与后续重放均拿到同一份结论，不再产生副作用。
+
+failed 与 release 的区别：failed 把失败结论固化下来供同键重放（如内部错误）；
+release 用于"可重试的拒绝"（如配额暂时不足），删除记录让同键重试重新判定。
 
 同一幂等键但请求体指纹不同 → IdempotencyConflictError(409)。
 """
@@ -116,6 +120,19 @@ class IdempotencyStore:
             entry.error_code = error_code
             entry.status_code = status_code
             entry.completed_at = self._clock()
+            entry.event.set()
+
+    def release(self, key: str) -> None:
+        """放弃占位，不留任何记录（用于配额不足等"可重试的拒绝"）。
+
+        与 fail 的区别：fail 会把失败结论固化下来供同键重放；release 直接
+        删除记录，后续同键同内容的请求会重新占位、重新走一遍完整判定——
+        例如配额窗口恢复后，同键重试可以真正生效而不是回放旧的拒绝。
+        正在等待的并发请求会被放行（发现记录已消失，按提示稍后携同键重试）。
+        """
+        with self._lock:
+            entry = self._entries.pop(key, None)
+        if entry is not None:
             entry.event.set()
 
     def purge_expired(self, now: float | None = None) -> None:

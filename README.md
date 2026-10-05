@@ -19,8 +19,10 @@ uv sync
 # 运行测试（-v 可看到每个用例的名称与结果；测试日志经 caplog 断言判定依据）
 uv run pytest
 uv run pytest -v
-# 只跑批量下单相关用例
-uv run pytest tests/test_batch.py -v
+# 加 --log-cli-level=INFO：实时看到每个用例覆盖的业务判定日志与用例结果行
+uv run pytest -v --log-cli-level=INFO
+# 只跑批量下单相关用例（含拒绝/重试/校验/超批的回归用例）
+uv run pytest tests/test_batch.py tests/test_batch_rejection.py -v
 
 # 启动服务
 uv run uvicorn main:app --reload
@@ -72,9 +74,14 @@ curl -i -X POST http://127.0.0.1:8000/orders/batch \
 # → 201 {"orders":[...3 条...], "applied":3, ...}，本批占用 3 条配额
 # 同一 Idempotency-Key + 同样请求体重放 → 201 同一份订单列表，Idempotent-Replay: true，
 #   不重复写、不重复扣额度
-# 其中任一条不合法（如 {"name":123}）→ 400 invalid_request，details.errors 的 loc
-#   指出是第几条（如 ["orders",1,"name"]），整批一条都不写
+# 其中任一条不合法（如 {"name":""}、{"name":"x","quantity":0}）→ 400 invalid_request，
+#   details.errors 的 loc 指出是第几条（如 ["orders",1,"name"]），整批一条都不写；
+#   修正内容后可用同一幂等键重新提交
 # 剩余额度不足整批 → 429 quota_exceeded，details 含 needed/remaining/retry_after_seconds
+#   与 retryable:true；窗口恢复后用同一幂等键 + 同一批内容重试会重新判定，
+#   额度够就 201 生效，不会回放旧的拒绝结论
+# 单批条数超过整段窗口配额 → 400 batch_exceeds_quota_limit（无 Retry-After），
+#   details 含 action:"split_batch" 与 max_batch_size，请拆成更小批次再提交
 ```
 
 ---
@@ -117,7 +124,7 @@ curl -i -X POST http://127.0.0.1:8000/orders/batch \
 - 服务端对请求体计算规范化指纹（JSON 键排序后 SHA-256）：
   - **同键 + 同指纹**：重复提交，回放首次结论，不再次执行业务。
   - **同键 + 不同指纹**：`409 idempotency_conflict`，调用方键用错了，必须换键。
-- 每个键在内存中是一条状态记录：`inflight → completed / failed`。
+- 每个键在内存中是一条状态记录：`inflight → completed / failed`；另外批量端点的**可重试拒绝**（配额不足、单批超配额上限）会走 `release` 直接释放占位、不留记录，让同键重试能重新判定（见第 4 节）。
 
 ### 并发重复请求（最多一个生效）
 
@@ -143,14 +150,15 @@ curl -i -X POST http://127.0.0.1:8000/orders/batch \
 
 `POST /orders/batch` 一次提交多条订单，请求体为 `{"orders": [...]}`（1–100 条）：
 
-- **原子性**：整批要么全部生效、要么一条都不生效。所有条目先整体校验，任一条不合法 → `400 invalid_request`，`details.errors` 的 `loc` 指出具体是哪一条（如 `["orders", 1, "name"]` 表示第 2 条的 `name` 字段），此时一条都不会写入；写入在同一把锁内一次完成，不存在“只写进去一半”的中间态。
-- **返回**：`201` 时响应体为 `{"orders": [...], "applied": N, "api_version": ...}`，`applied` 即本批实际生效条数。
+- **原子性**：整批要么全部生效、要么一条都不生效。所有条目先整体校验，任一条不合法 → `400 invalid_request`，`details.errors` 的 `loc` 指出具体是哪一条（如 `["orders", 1, "name"]` 表示第 2 条的 `name` 字段），此时一条都不会写入；写入在同一把锁内一次完成，不存在"只写进去一半"的中间态。
+- **条目校验边界**：每条订单的 `name` 必须是非空且非纯空白的字符串，`quantity` 必须是 ≥ 1 的整数（`amount` 不限）。空名字、纯空白名字、数量为 0 或负数都属于非法条目，会让整批被 `400` 拒绝、一条不写；校验发生在幂等占位**之前**，因此被拒后修正内容、用**同一幂等键**重新提交是允许的（不会触发 `409 idempotency_conflict`）。单笔下单 `POST /orders` 使用同一套校验规则。
+- **返回**：`201` 时响应体为 `{"orders": [...], "applied": N, "api_version": ...}`，`applied` 即本批实际生效条数（被整批拒绝的批次不会出现在成功返回里）。
 - **幂等**：整个请求体（含全部条目）计算一个指纹。同一幂等键 + 同一批内容重复提交 → 回放首次结论（同一份订单列表、同一个 `applied`），**不重复写、也不重复扣配额**；同键不同内容 → `409 idempotency_conflict`；并发同键请求同样最多一个生效。
 - **配额按条数计**：本批的配额占用 = 批内条数（`cost = len(orders)`），不是按请求次数。判定与扣减在限流器的同一把锁内原子完成：
   - 剩余额度 ≥ 批内条数 → 整批放行并一次扣减；
-  - 剩余额度不足 → **整批拒绝**（`429 quota_exceeded`），一条不写、一分额度不扣；错误体 `details` 说明 `needed`（本次需要多少条）、`remaining`（当前还剩多少条）、`limit` / `window_seconds` 与 `retry_after_seconds`（预计多久后可重试，按“累计释放足够条数”的最早时刻估算），并带 `Retry-After` 头；若单批条数超过配额上限本身，`retry_after_seconds` 为 0，请拆分批次；
+  - 剩余额度不足（但整批条数 ≤ 窗口配额上限）→ **整批拒绝**（`429 quota_exceeded`），一条不写、一分额度不扣；错误体 `details` 说明 `needed`（本次需要多少条）、`remaining`（当前还剩多少条）、`limit` / `window_seconds`、`retry_after_seconds`（预计多久后可重试，按"累计释放足够条数"的最早时刻估算）与 `retryable: true`，并带 `Retry-After` 头。**这是可重试的拒绝**：配额拒绝不会固化成幂等失败记录，窗口恢复后携带**同一幂等键 + 同一批内容**重试会重新走一遍完整判定——额度够就正常生效（`201`），仍不够才继续 `429`；生效之后同键重试才走幂等回放；
+  - 单批条数 > 窗口配额上限本身 → `400 batch_exceeds_quota_limit`：这种情况等多久都不可能整批放下，与"暂时不够"明确区分——**不带 `Retry-After` 头**，`details` 含 `retryable: false`、`action: "split_batch"` 与 `max_batch_size`（即窗口配额上限），请把订单拆成不超过该上限的更小批次再提交（可继续使用同一幂等键，超批拒绝同样不占键）；
   - 多个批量请求并发提交时，原子扣减保证成功占用合计不超过配额（见 `test_concurrent_batches_never_exceed_quota`）。
-- 配额拒绝会被记为该幂等键的失败结论（与单笔下单的失败语义一致）：同键重放得到 `idempotent_replay_quota_exceeded`，如需重试请**更换新幂等键**。
 
 ---
 
@@ -193,18 +201,19 @@ curl -i -X POST http://127.0.0.1:8000/orders/batch \
 
 错误码目录：`version_undeclared` / `version_unknown` / `version_sunset` /
 `idempotency_key_missing` / `idempotency_conflict` / `idempotency_inflight` /
-`idempotent_replay_*` / `quota_exceeded` / `invalid_request` / `resource_not_found`。
+`idempotent_replay_*` / `quota_exceeded` / `batch_exceeds_quota_limit` /
+`invalid_request` / `resource_not_found`。
 
 ## 7. 日志（判定依据可解释）
 
 `api_gateway` logger 输出单行结构化日志（`event=... key=value`），关键事件：
 
 - `event=version_decision`：`result=supported|deprecated|rejected`，拒绝时带 `reason=...`，并打印 `requested/sunset_at/successor`；
-- `event=idempotency_decision`：打印 `idempotency_key`、请求体指纹前缀与 `outcome=acquired|completed|waiting|replay|failed`（批量请求另带 `batch_size`）；
+- `event=idempotency_decision`：打印 `idempotency_key`、请求体指纹前缀与 `outcome=acquired|completed|waiting|replay|failed`（批量请求另带 `batch_size`）；配额类拒绝走 `release`（释放占位、不留记录），因此窗口恢复后的同键重试会再次出现 `outcome=acquired` 而不是 `outcome=replay`；
 - `event=quota_decision`：打印 `caller / used / limit / window_seconds / allowed / reset_in_seconds`（批量请求另带 `cost`，即本批条数）；
-- `event=batch_decision`：批量请求的结论——`result=applied` 时带 `applied=<生效条数>`；`result=rejected` 时带 `reason=quota_exceeded` 与 `needed / remaining / retry_after_seconds`。
+- `event=batch_decision`：批量请求的结论——`result=applied` 时带 `applied=<生效条数>`；`result=rejected` 时带 `reason=quota_exceeded`（暂时不够，可稍后同键重试）或 `reason=batch_exceeds_quota_limit`（单批超过整段配额，需拆批），并附 `needed / remaining / retry_after_seconds` 等判定依据。
 
-测试运行时的判定日志同样可被 `caplog` 捕获并断言（见 `tests/test_api.py`、`tests/test_batch.py` 的日志用例）；`uv run pytest -v` 会逐个列出用例名与结果。
+测试运行时的判定日志同样可被 `caplog` 捕获并断言（见 `tests/test_api.py`、`tests/test_batch.py`、`tests/test_batch_rejection.py` 的日志用例）；`uv run pytest -v` 会逐个列出用例名与结果，加 `--log-cli-level=INFO` 还能在输出中实时看到每个用例覆盖的业务判定日志，以及每个用例的结果行（`event=test_case case=<用例名> result=passed|failed|skipped`）。
 
 ## 8. 代码结构
 
@@ -219,5 +228,6 @@ gateway/
   app.py          # FastAPI 装配：中间件管道 + 单笔/批量路由 + 统一错误体 + 日志
 main.py           # uvicorn 入口（main:app）
 tests/            # 版本协商 / 幂等（含并发）/ 限流（滑动窗口+按条计费+并发）/
-                  # 批量（原子性+配额+并发+隔离+窗口边缘）/ 端到端与日志
+                  # 批量（原子性+配额+并发+隔离+窗口边缘）/
+                  # 批量拒绝回归（同键重试语义+条目校验+超批指引）/ 端到端与日志
 ```

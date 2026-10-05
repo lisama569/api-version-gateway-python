@@ -13,10 +13,11 @@ from typing import Any, Callable
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from gateway.config import QuotaRule, Settings, VersionStatus, default_settings
 from gateway.errors import (
+    BatchExceedsQuotaLimitError,
     GatewayError,
     IdempotencyKeyMissingError,
     QuotaExceededError,
@@ -57,9 +58,18 @@ _EXEMPT_PATHS = {
 
 
 class CreateOrderBody(BaseModel):
-    name: str
-    quantity: int = 1
+    """单条下单内容：空名字（含纯空白）与非正数量均属非法条目。"""
+
+    name: str = Field(min_length=1)
+    quantity: int = Field(default=1, ge=1)
     amount: int = 0
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("name 不能只包含空白字符")
+        return value
 
 
 class BatchCreateOrderBody(BaseModel):
@@ -82,11 +92,11 @@ class GatewayState:
 
 
 def configure_logging(level: int = logging.INFO) -> None:
-    """配置单行结构化日志（key=value，便于检索版本/幂等/配额判定依据）。"""
+    """配置单行结构化日志（event=... key=value，便于检索版本/幂等/配额判定依据）。"""
     handler = logging.StreamHandler()
     handler.setFormatter(
         logging.Formatter(
-            fmt="%(asctime)s %(levelname)s event=%(event)s %(message)s",
+            fmt="%(asctime)s %(levelname)s %(message)s",
             datefmt="%Y-%m-%dT%H:%M:%S%z",
         )
     )
@@ -97,9 +107,9 @@ def configure_logging(level: int = logging.INFO) -> None:
 
 
 def log_event(event: str, **fields: Any) -> None:
-    """打印一条结构化事件日志。"""
+    """打印一条结构化事件日志（事件名直接编进行内，任何日志管道都能看到）。"""
     parts = [f"{k}={_render(v)}" for k, v in fields.items() if v is not None]
-    logger.info(" ".join(parts), extra={"event": event})
+    logger.info(f"event={event} " + " ".join(parts), extra={"event": event})
 
 
 def _render(value: Any) -> str:
@@ -151,9 +161,24 @@ def _register_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=400,
             content=_error_payload(
-                "invalid_request", "请求体或参数不合法。", {"errors": exc.errors()}
+                "invalid_request", "请求体或参数不合法。", {"errors": _safe_errors(exc)}
             ),
         )
+
+
+def _safe_errors(exc: RequestValidationError) -> list[dict[str, Any]]:
+    """把 pydantic 校验错误转成可 JSON 序列化的结构。
+
+    value_error 类错误的 ctx 里可能带有原始异常对象（不可序列化），
+    统一转成字符串，保留 loc（含条目下标）以便调用方定位到具体条目。
+    """
+    safe: list[dict[str, Any]] = []
+    for error in exc.errors():
+        item = dict(error)
+        if "ctx" in item:
+            item["ctx"] = {k: str(v) for k, v in item["ctx"].items()}
+        safe.append(item)
+    return safe
 
 
 def _register_middleware(app: FastAPI, state: GatewayState, clock: Callable[[], float]) -> None:
@@ -445,7 +470,8 @@ def _execute_batch(
     """批量幂等占位赢家路径：先按条数原子扣减额度，再一次原子写入整批。
 
     顺序保证：只有占位赢家才会扣额度（重放不重复计费）；
-    额度不足时整批拒绝、一条不写，并把失败结论记入幂等记录。
+    额度不足时整批拒绝、一条不写，且释放幂等占位（release 而非 fail），
+    使窗口恢复后的同键重试能重新判定，而不是回放第一次的拒绝结论。
     """
     cost = len(payloads)
     rule: QuotaRule = request.state.quota_rule
@@ -463,7 +489,41 @@ def _execute_batch(
         reset_in_seconds=quota.retry_after_seconds,
     )
     if not quota.allowed:
-        state.idempotency.fail(scoped_key, QuotaExceededError.error_code, 429)
+        # 配额类拒绝是"可重试的拒绝"：不固化失败结论，释放幂等占位，
+        # 让窗口恢复后的同键重试能重新走一遍完整判定（额度够就生效）。
+        state.idempotency.release(scoped_key)
+        if cost > rule.limit:
+            # 单批条数超过整段窗口配额：等多久都不可能放下，与"暂时不够"区分开，
+            # 明确指引调用方拆成更小的批次，而不是按 Retry-After 立刻反复重试。
+            log_event(
+                "batch_decision",
+                idempotency_key=raw_key,
+                caller=caller,
+                result="rejected",
+                reason="batch_exceeds_quota_limit",
+                needed=cost,
+                limit=quota.limit,
+                window_seconds=quota.window_seconds,
+            )
+            return JSONResponse(
+                status_code=BatchExceedsQuotaLimitError.status_code,
+                content=_error_payload(
+                    BatchExceedsQuotaLimitError.error_code,
+                    f"本批共 {cost} 条，已超过调用方 {caller} 的整段窗口配额上限 "
+                    f"{quota.limit} 条/{quota.window_seconds:g}s：无论等待多久都无法"
+                    "整批放下，请拆成不超过该上限的更小批次后重新提交（可继续使用"
+                    "同一幂等键，窗口恢复语义不适用于本场景）。",
+                    {
+                        "caller": caller,
+                        "needed": cost,
+                        "limit": quota.limit,
+                        "window_seconds": quota.window_seconds,
+                        "max_batch_size": quota.limit,
+                        "retryable": False,
+                        "action": "split_batch",
+                    },
+                ),
+            )
         log_event(
             "batch_decision",
             idempotency_key=raw_key,
@@ -480,7 +540,8 @@ def _execute_batch(
                 QuotaExceededError.error_code,
                 f"调用方 {caller} 剩余额度不足以覆盖整批：本次需要 {cost} 条，"
                 f"当前剩余 {quota.remaining} 条（窗口配额 {quota.limit} 条/"
-                f"{quota.window_seconds:g}s），约 {quota.retry_after_seconds:.0f} 秒后可重试。",
+                f"{quota.window_seconds:g}s），约 {quota.retry_after_seconds:.0f} 秒后可重试。"
+                "窗口恢复后可携带同一幂等键与同一批内容重试，届时将重新判定。",
                 {
                     "caller": caller,
                     "needed": cost,
@@ -488,6 +549,7 @@ def _execute_batch(
                     "limit": quota.limit,
                     "window_seconds": quota.window_seconds,
                     "retry_after_seconds": quota.retry_after_seconds,
+                    "retryable": True,
                 },
             ),
             headers={"Retry-After": str(int(quota.retry_after_seconds))},
